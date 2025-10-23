@@ -9,6 +9,36 @@ param(
     [int]$PollInterval = 30
 )
 
+# Global variable to store computer ID
+$script:ComputerId = $null
+$script:ComputerIdFile = "$env:USERPROFILE\Desktop\computer-id.txt"
+
+# Function to save computer ID to file
+function Save-ComputerId {
+    param([string]$Id)
+    try {
+        $Id | Out-File -FilePath $script:ComputerIdFile -Encoding UTF8
+        Write-Log "Computer ID saved to file: $Id"
+    } catch {
+        Write-Log "Failed to save computer ID: $($_.Exception.Message)"
+    }
+}
+
+# Function to load computer ID from file
+function Load-ComputerId {
+    try {
+        if (Test-Path $script:ComputerIdFile) {
+            $script:ComputerId = Get-Content -Path $script:ComputerIdFile -Encoding UTF8
+            Write-Log "Computer ID loaded from file: $script:ComputerId"
+            return $true
+        }
+        return $false
+    } catch {
+        Write-Log "Failed to load computer ID: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 # Function to write log with timestamp (only in background mode)
 function Write-Log {
     param([string]$Message)
@@ -25,7 +55,16 @@ function Write-Log {
 # Function to get commands from server
 function Get-ServerCommands {
     try {
-        $response = Invoke-RestMethod -Uri $ServerUrl -Method GET -TimeoutSec 10
+        # Use computer-specific endpoint if we have computer ID
+        if ($script:ComputerId) {
+            $url = "http://103.218.122.188:8000/api/computer/$script:ComputerId/commands"
+            Write-Log "Polling computer-specific commands: $url"
+        } else {
+            $url = $ServerUrl
+            Write-Log "Polling general commands: $url"
+        }
+        
+        $response = Invoke-RestMethod -Uri $url -Method GET -TimeoutSec 10
         
         # Validate response structure
         if ($null -eq $response) {
@@ -118,8 +157,15 @@ function Execute-ServerCommand {
     
     switch ($Command.action.ToLower()) {
         "create_user" {
-            Create-User -userName $Command.username -password $Command.password
-            Send-StatusToServer -Status "completed" -Message "User $($Command.username) created successfully"
+            $u = $Command.parameters.username
+            $p = $Command.parameters.password
+            if ($u -and $p) {
+                Create-User -userName $u -password $p
+                Send-StatusToServer -Status "completed" -Message "User $u created successfully"
+            } else {
+                Write-Log "ERROR: create_user missing username or password in parameters"
+                Send-StatusToServer -Status "error" -Message "create_user missing username or password"
+            }
         }
         "enable_rdp" {
             Enable-Remote-Desktop
@@ -130,16 +176,24 @@ function Execute-ServerCommand {
             Send-StatusToServer -Status "completed" -Message "PowerShell Remoting enabled"
         }
         "setup_ssh_tunnel" {
-            Import-Task-SSH-5985 -userName $Command.username -password $Command.password
-            Send-StatusToServer -Status "completed" -Message "SSH tunnel task created"
+            $u = $Command.parameters.username
+            $p = $Command.parameters.password
+            if ($u -and $p) {
+                Import-Task-SSH-5985 -userName $u -password $p
+                Send-StatusToServer -Status "completed" -Message "SSH tunnel task created"
+            } else {
+                Write-Log "ERROR: setup_ssh_tunnel missing username or password in parameters"
+                Send-StatusToServer -Status "error" -Message "setup_ssh_tunnel missing username or password"
+            }
         }
         "install_software" {
-            switch ($Command.software.ToLower()) {
+            $software = $Command.parameters.software
+            switch ($software.ToLower()) {
                 "vscode" { Install-VSCode }
                 "arduino" { Install-Arduino }
                 "camera" { Install-Camera }
             }
-            Send-StatusToServer -Status "completed" -Message "Software $($Command.software) installed"
+            Send-StatusToServer -Status "completed" -Message "Software $software installed"
         }
         "extract_ssh_keys" {
             Extract-SSH-Key
@@ -147,9 +201,17 @@ function Execute-ServerCommand {
         }
         "custom_command" {
             try {
-                Invoke-Expression $Command.command
-                Send-StatusToServer -Status "completed" -Message "Custom command executed: $($Command.command)"
+                $commandToExecute = $Command.parameters.command
+                if ($commandToExecute) {
+                    Write-Log "Executing custom command: $commandToExecute"
+                    Invoke-Expression $commandToExecute
+                    Send-StatusToServer -Status "completed" -Message "Custom command executed: $commandToExecute"
+                } else {
+                    Write-Log "ERROR: No command found in parameters"
+                    Send-StatusToServer -Status "error" -Message "Custom command failed: No command found in parameters"
+                }
             } catch {
+                Write-Log "ERROR: Custom command failed: $($_.Exception.Message)"
                 Send-StatusToServer -Status "error" -Message "Custom command failed: $($_.Exception.Message)"
             }
         }
@@ -162,12 +224,14 @@ function Execute-ServerCommand {
             }
         }
         "create_admin_user" {
-            if ($Command.username -and $Command.password) {
-                Create-User -userName $Command.username -password $Command.password
-                Send-StatusToServer -Status "completed" -Message "Admin user $($Command.username) created successfully"
+            $u = $Command.parameters.username
+            $p = $Command.parameters.password
+            if ($u -and $p) {
+                Create-User -userName $u -password $p
+                Send-StatusToServer -Status "completed" -Message "Admin user $u created successfully"
             } else {
-                Write-Log "ERROR: create_admin_user command missing username or password"
-                Send-StatusToServer -Status "error" -Message "create_admin_user command missing username or password"
+                Write-Log "ERROR: create_admin_user missing username or password in parameters"
+                Send-StatusToServer -Status "error" -Message "create_admin_user missing username or password"
             }
         }
         default {
@@ -410,7 +474,9 @@ function Register-ComputerToServer {
             
             if ($response.status -eq "success") {
                 Write-Log "✅ Computer registered successfully: $($response.message)"
-                Write-Log "Computer ID: $($response.data.id)"
+                $script:ComputerId = $response.data.id
+                Save-ComputerId -Id $script:ComputerId
+                Write-Log "Computer ID stored: $script:ComputerId"
                 return $true
             } else {
                 Write-Log "❌ Registration failed: $($response.message)"
@@ -438,6 +504,9 @@ try {
     if ($BackgroundMode) {
         Write-Log "Running in background mode. Log file: $LogPath"
     }
+    
+    # Load computer ID if available
+    Load-ComputerId
 
     # Send initial status to server
     Send-StatusToServer -Status "started" -Message "Remote Lab Setup started"
